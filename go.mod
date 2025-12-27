@@ -1,4 +1,4 @@
-module github.com/carved4/chrome-abe
+module github.com/carved4/gobound
 
 go 1.24.11
 
