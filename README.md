@@ -9,7 +9,7 @@ this works for V20 cookies/passwords (app bound encryption), for prior versions 
 2. downloads a payload dll from a remote url
 3. injects the dll into chrome using manual pe mapping (no loadlibrary)
 4. the dll uses chrome's elevation service to decrypt the master key
-5. extracts cookies and passwords from all chrome profiles
+5. extracts cookies, passwords, and saved cards from all chrome profiles
 6. sends data back via named pipe
 7. saves everything to `chrome_data.json`
 
@@ -43,6 +43,7 @@ go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll
 - master key (base64)
 - cookies (profile, host, name, value)
 - passwords (profile, url, username, password)
+- cards (profile, name on card, expiration, number)
 
 ## dependencies
 

