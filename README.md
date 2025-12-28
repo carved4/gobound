@@ -3,6 +3,9 @@
 remote dll injection into chrome to extract cookies and passwords via the chrome elevator com interface.
 this works for V20 cookies/passwords (app bound encryption), for prior versions just call cryptunprotect as curr user
 
+# demo 
+![demo](https://github.com/user-attachments/assets/97530baa-03fb-47aa-890b-6f94b541ad69)
+
 ## what it does
 
 1. finds a running chrome process
