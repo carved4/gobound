@@ -3,8 +3,8 @@ module github.com/carved4/gobound
 go 1.24.11
 
 require (
-	github.com/carved4/go-wincall v1.2.4
-	modernc.org/sqlite v1.41.0
+	github.com/carved4/go-wincall v1.2.5
+	modernc.org/sqlite v1.42.2
 )
 
 require (

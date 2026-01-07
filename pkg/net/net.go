@@ -39,7 +39,7 @@ func Download(url string) ([]byte, error) {
 	} else {
 		return nil, fmt.Errorf("only HTTPS supported")
 	}
-	wincall.LoadLibraryW("winhttp.dll")
+	wincall.LoadLibraryLdr("winhttp.dll")
 	dllHash := wincall.GetHash("winhttp.dll")
 	moduleBase := wincall.GetModuleBase(dllHash)
 	winHttpOpenHash := wincall.GetHash("WinHttpOpen")
