@@ -7,13 +7,13 @@ this works for v20 cookies/passwords (app bound encryption), for prior versions 
 
 1. scans all chrome.exe processes for open handles to database files (cookies, login data, web data)
 2. identifies which chrome process owns the database handles
-3. duplicates the handles and extracts locked database files to temp directory
+3. duplicates the handles and extracts locked database files directly into memory
 4. downloads the payload dll from https endpoint
 5. injects the dll into the chrome process that owns the database handles using manual pe mapping
 6. the dll uses chrome's elevation service to decrypt the master key
 7. the dll sends the decrypted master key back to the injector via named pipe
-8. injector decrypts all data locally using the master key
-9. cleans up temp files and saves everything to `chrome_data.json`
+8. injector decrypts all data in-memory using the master key
+9. saves everything to `chrome_data.json` (no temp files created)
 
 ## technical details
 
@@ -26,14 +26,16 @@ this works for v20 cookies/passwords (app bound encryption), for prior versions 
 
 ### extraction flow
 - duplicated handles allow reading sqlite databases that are locked by chrome
-- files are extracted to `os.tempdir()` with naming scheme: `chrome_{dbtype}_{pid}.db`
+- database contents are read directly into memory (no temp files)
+- sqlite parsing uses in-memory deserialization via `zombiezen.com/go/sqlite`
 - injector performs all sqlite queries and decryption locally after receiving the master key
 - all database processing happens in the injector, not the dll
 
 ### encryption handling
-- dll uses chrome's `ichromeupdate` elevation service com interface to decrypt app-bound master key
+- dll uses chrome's `ielevator` com interface to decrypt app-bound master key
 - dll sends master key back to injector as hex string via named pipe
-- injector uses the master key to decrypt aes-gcm encrypted v20 values from extracted databases
+- injector uses windows cng apis (`bcryptdecrypt`) for aes-gcm decryption of v20 values
+- no go crypto libraries used - all decryption via native windows apis
 - supports extraction from all chrome profiles (default, profile 1, profile 2, etc)
 
 ## building
@@ -63,7 +65,7 @@ go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o gobound.dll
 ## output
 
 `chrome_data.json` contains:
-- master key (hex)
+- master key (base64 and hex)
 - cookies (profile, host, name, value)
 - passwords (profile, url, username, password)
 - cards (profile, name on card, expiration, number)
@@ -76,13 +78,13 @@ go build -buildmode=c-shared -ldflags="-s -w" -trimpath -o gobound.dll
 - no database handling, no file operations, no sqlite
 
 ### injector (full featured - ~950 lines)
-- handle scanning and file extraction
+- handle scanning and in-memory file extraction
 - dll injection using manual pe mapping
-- sqlite database parsing (cookies, passwords, cards)
-- aes-gcm decryption using master key from dll
+- in-memory sqlite database parsing (cookies, passwords, cards)
+- aes-gcm decryption using windows cng apis (bcrypt)
 - output generation
 
 ## dependencies
 
 - github.com/carved4/go-wincall - syscalls and win32 api
-- modernc.org/sqlite - pure go sqlite for reading chrome dbs (injector only)
+- zombiezen.com/go/sqlite - sqlite with in-memory deserialization support
