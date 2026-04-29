@@ -371,21 +371,116 @@ func getRemoteModuleBase(hProcess uintptr, moduleName string) (uintptr, error) {
 	return 0, errors.New("module not found")
 }
 
+var cachedApiSetMap uintptr
+
+func getApiSetMap() uintptr {
+	if cachedApiSetMap != 0 {
+		return cachedApiSetMap
+	}
+	ntQuery := wc.GetSyscall(wc.GetHash("NtQueryInformationProcess"))
+	var pbi processBasicInformation
+	var returnLength uint32
+	currentProcess := ^uintptr(0)
+	ret, _ := wc.IndirectSyscall(ntQuery.SSN, ntQuery.Address,
+		currentProcess, 0, uintptr(unsafe.Pointer(&pbi)), unsafe.Sizeof(pbi), uintptr(unsafe.Pointer(&returnLength)))
+	if ret != 0 || pbi.PebBaseAddress == 0 {
+		return 0
+	}
+	cachedApiSetMap = *(*uintptr)(unsafe.Pointer(pbi.PebBaseAddress + 0x68))
+	return cachedApiSetMap
+}
+
 func resolveApiSet(name string) string {
-	n := strings.ToLower(name)
-	if strings.HasPrefix(n, "api-ms-win-crt-") {
-		return "ucrtbase.dll"
+	apiSetMap := getApiSetMap()
+	if apiSetMap == 0 {
+		return ""
 	}
-	if strings.HasPrefix(n, "api-ms-win-core-") {
-		return "kernelbase.dll"
+
+	version := *(*uint32)(unsafe.Pointer(apiSetMap))
+	if version != 6 {
+		return ""
 	}
-	if strings.HasPrefix(n, "ext-ms-") {
-		return "kernelbase.dll"
+
+	count := *(*uint32)(unsafe.Pointer(apiSetMap + 0x0C))
+	entryOffset := *(*uint32)(unsafe.Pointer(apiSetMap + 0x10))
+	hashOffset := *(*uint32)(unsafe.Pointer(apiSetMap + 0x14))
+	hashFactor := *(*uint32)(unsafe.Pointer(apiSetMap + 0x18))
+
+	if count == 0 {
+		return ""
 	}
-	if strings.HasPrefix(n, "api-ms-win-security-") || strings.HasPrefix(n, "api-ms-win-eventing-") {
-		return "advapi32.dll"
+
+	lookup := strings.ToLower(name)
+	if strings.HasSuffix(lookup, ".dll") {
+		lookup = lookup[:len(lookup)-4]
 	}
-	return ""
+	dashIdx := strings.LastIndex(lookup, "-")
+	if dashIdx < 0 {
+		return ""
+	}
+	lookup = lookup[:dashIdx]
+
+	var hash uint32
+	for _, c := range lookup {
+		hash = hash*hashFactor + uint32(c)
+	}
+
+	hashTable := apiSetMap + uintptr(hashOffset)
+	low := int32(0)
+	high := int32(count) - 1
+	foundIdx := int32(-1)
+
+	for low <= high {
+		mid := (low + high) / 2
+		entryHash := *(*uint32)(unsafe.Pointer(hashTable + uintptr(mid*8)))
+		if hash < entryHash {
+			high = mid - 1
+		} else if hash > entryHash {
+			low = mid + 1
+		} else {
+			foundIdx = int32(*(*uint32)(unsafe.Pointer(hashTable + uintptr(mid*8) + 4)))
+			break
+		}
+	}
+
+	if foundIdx < 0 {
+		return ""
+	}
+
+	nsEntry := apiSetMap + uintptr(entryOffset) + uintptr(foundIdx)*24
+	hashedLen := *(*uint32)(unsafe.Pointer(nsEntry + 0x0C))
+	valueOff := *(*uint32)(unsafe.Pointer(nsEntry + 0x10))
+	valueCount := *(*uint32)(unsafe.Pointer(nsEntry + 0x14))
+
+	entryName := wideStringAt(apiSetMap+uintptr(*(*uint32)(unsafe.Pointer(nsEntry + 0x04))), hashedLen)
+	if !strings.EqualFold(lookup, entryName) {
+		return ""
+	}
+
+	if valueCount == 0 {
+		return ""
+	}
+
+	valEntry := apiSetMap + uintptr(valueOff)
+	resolvedOff := *(*uint32)(unsafe.Pointer(valEntry + 0x0C))
+	resolvedLen := *(*uint32)(unsafe.Pointer(valEntry + 0x10))
+	if resolvedLen == 0 {
+		return ""
+	}
+
+	return wideStringAt(apiSetMap+uintptr(resolvedOff), resolvedLen)
+}
+
+func wideStringAt(addr uintptr, byteLen uint32) string {
+	if byteLen == 0 {
+		return ""
+	}
+	charCount := byteLen / 2
+	u16 := make([]uint16, charCount)
+	for i := uint32(0); i < charCount; i++ {
+		u16[i] = *(*uint16)(unsafe.Pointer(addr + uintptr(i*2)))
+	}
+	return string(utf16.Decode(u16))
 }
 
 func isApiSet(name string) bool {
